@@ -120,11 +120,32 @@ def get_or_create_vendor(conn, vendor_name="Openssl"):
     return vendor_id
 
 # -------------------------
-# Advisory ID generator (Openssl-CVE-xxxx-yyyy)
+# Advisory ID generator
 # -------------------------
-def generate_advisory_id(cve_id: str) -> str:
-    """Advisory ID is just Openssl-{cve_id}"""
-    return f"Openssl-{cve_id}"
+def generate_advisory_id(cve_id: str, staging_id: int) -> str:
+    """Use Openssl-CVE if cve_id exists, else fallback to staging_id"""
+    if cve_id:
+        return f"Openssl-{cve_id}"
+    return f"Openssl-ADV-{staging_id}"
+
+# -------------------------
+# Recursive title search
+# -------------------------
+def extract_title(data):
+    """Recursively find 'title' anywhere in JSON"""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k.lower() == "title" and isinstance(v, str) and v.strip():
+                return v.strip()
+            found = extract_title(v)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = extract_title(item)
+            if found:
+                return found
+    return None
 
 # -------------------------
 # Main normalization
@@ -146,34 +167,32 @@ def process_staging_data(conn):
 
     for staging_id, vendor_name, raw_json in rows:
         try:
-            if isinstance(raw_json, str):
-                try:
-                    data = json.loads(raw_json)
-                except json.JSONDecodeError as e:
-                    logger.error("staging_id %s: invalid JSON: %s", staging_id, e)
-                    continue
-            else:
-                data = raw_json
-
+            data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
             cna = data.get("containers", {}).get("cna", {})
             cve_metadata = data.get("cveMetadata", {})
-            cve_id = cve_metadata.get("cveId")
-            if not cve_id:
-                logger.warning("staging_id %s: no cveId, skipping", staging_id)
-                continue
 
+            cve_id = cve_metadata.get("cveId") or None
             vendor_id = get_or_create_vendor(conn, vendor_name)
-            advisory_id = generate_advisory_id(cve_id)
+            advisory_id = generate_advisory_id(cve_id, staging_id)
 
-            title = cna.get("title", "") or ""
-            desc = ""
+            # Title: cna.title or recursively in raw JSON
+            title = cna.get("title") or extract_title(data) or None
+
+            # Description
+            desc = None
             if cna.get("descriptions"):
-                desc = cna["descriptions"][0].get("value", "")
+                for d in cna["descriptions"]:
+                    if d.get("lang") == "en":
+                        desc = d.get("value") or None
+                        break
 
-            severity = None
+            # Severity
+            advisory_severity = None
+            cve_severity = None
             if cna.get("metrics"):
-                severity = cna["metrics"][0].get("other", {}).get("content", {}).get("text")
+                cve_severity = cna["metrics"][0].get("other", {}).get("content", {}).get("text") or None
 
+            # Dates
             initial_release_date = None
             date_public_str = cna.get("datePublic")
             if date_public_str:
@@ -181,30 +200,32 @@ def process_staging_data(conn):
                     initial_release_date = datetime.fromisoformat(date_public_str.replace("Z", "+00:00")).date()
                 except Exception:
                     initial_release_date = None
-            latest_updated_date = None
+            latest_updated_date = None  # CVE dates remain NULL
 
-            cwe_id = None
+            # CWE IDs (combine multiple)
+            cwe_ids = []
             for pt in cna.get("problemTypes", []):
                 for di in pt.get("descriptions", []):
-                    cwe_id = di.get("cweId")
-                    break
-                if cwe_id:
-                    break
+                    cwe_val = di.get("cweId")
+                    if cwe_val:
+                        cwe_ids.append(cwe_val)
+            cwe_id = ",".join(cwe_ids) if cwe_ids else None
 
+            # References
             references = cna.get("references", [])
             reference_url = None
             if references:
                 formatted = []
                 for r in references:
-                    name = r.get("name", "").strip()
-                    link = r.get("url", "").strip()
+                    name = (r.get("name") or "").strip()
+                    link = (r.get("url") or "").strip()
                     if name and link:
                         formatted.append(f"{name}: {link}")
                     elif link:
                         formatted.append(link)
                 reference_url = ", ".join(formatted) if formatted else None
 
-            advisory_url = data.get("advisory_url")
+            advisory_url = data.get("advisory_url") or None
 
             cur = conn.cursor()
             try:
@@ -216,7 +237,7 @@ def process_staging_data(conn):
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (advisory_id) DO NOTHING;
                     """,
-                    (advisory_id, vendor_id, title, severity, initial_release_date, latest_updated_date, advisory_url)
+                    (advisory_id, vendor_id, title, advisory_severity, initial_release_date, latest_updated_date, advisory_url)
                 )
                 counts["advisories"] += 1
 
@@ -228,51 +249,32 @@ def process_staging_data(conn):
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (cve_id) DO NOTHING;
                     """,
-                    (cve_id, cwe_id, desc, severity, None, None, initial_release_date, latest_updated_date, reference_url)
+                    (cve_id, cwe_id, desc, cve_severity, None, None, None, None, reference_url)
                 )
                 counts["cves"] += 1
 
                 # Mapping advisory <-> CVE
-                cur.execute(
-                    f"""
-                    INSERT INTO {TABLE_ADV_CVE_MAP} (advisory_id, cve_id)
-                    VALUES (%s, %s)
-                    ON CONFLICT (advisory_id, cve_id) DO NOTHING;
-                    """,
-                    (advisory_id, cve_id)
-                )
-                counts["mappings"] += 1
-
-                # Product mappings (CPE logic commented out but included)
-                for aff in cna.get("affected", []):
-                    # Example CPE logic (currently disabled):
-                    # product_name = aff.get("product")
-                    # for v in aff.get("versions", []):
-                    #     version = v.get("version")
-                    #     less_than = v.get("lessThan")
-                    #     cpe = f"cpe:2.3:a:{vendor_name}:{product_name}:{version}:*:*:*:*:*:*:*"
-                    #     if less_than:
-                    #         cpe += f" < {less_than}"
-                    #     cur.execute(
-                    #         f"""
-                    #         INSERT INTO {TABLE_CVE_PRODUCT_MAP} (cve_id, affected_products_cpe, recommendations)
-                    #         VALUES (%s, %s, %s)
-                    #         ON CONFLICT DO NOTHING;
-                    #         """,
-                    #         (cve_id, json.dumps([cpe]), None)
-                    #     )
-
-                    # For now, insert NULL product CPE
-                    recommendation = None
+                if cve_id:
                     cur.execute(
                         f"""
-                        INSERT INTO {TABLE_CVE_PRODUCT_MAP} (cve_id, affected_products_cpe, recommendations)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (cve_id) DO NOTHING;
+                        INSERT INTO {TABLE_ADV_CVE_MAP} (advisory_id, cve_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (advisory_id, cve_id) DO NOTHING;
                         """,
-                        (cve_id, None, recommendation)
+                        (advisory_id, cve_id)
                     )
-                    counts["products"] += 1
+                    counts["mappings"] += 1
+
+                # Product mapping
+                cur.execute(
+                    f"""
+                    INSERT INTO {TABLE_CVE_PRODUCT_MAP} (cve_id, affected_products_cpe, recommendations)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (cve_id) DO NOTHING;
+                    """,
+                    (cve_id, None, None)
+                )
+                counts["products"] += 1
 
                 # Mark staging row processed
                 cur.execute(
